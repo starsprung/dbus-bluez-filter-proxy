@@ -1,0 +1,43 @@
+[package]
+name = "dbus-bluez-filter-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "BlueZ-aware filtering D-Bus proxy. Restricts visibility & access to specific HCI adapters through D-Bus."
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "dbus-bluez-filter-proxy"
+path = "src/main.rs"
+
+[lib]
+name = "dbus_bluez_filter_proxy"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "signal"] }
+zbus = { version = "4", default-features = false, features = ["tokio"] }
+zvariant = "4"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "1"
+hex = "0.4"
+nix = { version = "0.29", features = ["user", "socket", "process"] }
+libc = "0.2"
+quick-xml = "0.37"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "test-util", "process"] }
+tempfile = "3"
+assert_matches = "1"
+futures-util = "0.3"
+
+[build-dependencies]
+# Generate Rust ffi bindings from <bluetooth/hci.h> at build time so
+# struct layouts auto-track kernel/bluez header changes. Pinned to
+# a 0.x release; bindgen's API churns slowly enough that a 0.71
+# pin is fine and bumping is a minor PR.
+bindgen = "0.71"

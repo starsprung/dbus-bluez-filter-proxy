@@ -1,0 +1,49 @@
+# dbus-bluez-filter-proxy: BlueZ-aware filtering D-Bus proxy.
+# Copyright (C) 2026 Shaun Starsprung
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# Test container — fully self-contained build + cargo test.
+#
+# Build/run via `./run-tests.sh`.
+#
+# Pinned image tag for reproducibility; bump intentionally.
+FROM rust:1.94-slim-bookworm
+
+# dbus-daemon + libdbus headers + pkg-config: required by the
+# integration tests, which spin up a real bus. libbluetooth-dev +
+# libclang-dev are bindgen build deps for the HCI ioctl bindings.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        dbus dbus-daemon \
+        pkg-config \
+        libdbus-1-dev \
+        libbluetooth-dev \
+        libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work
+
+# One-shot copy. Docker's layer cache handles incremental rebuilds
+# across `docker build` invocations; cargo's own target/ cache lives
+# inside the layer so it persists for the image's lifetime.
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY src/    src/
+COPY tests/  tests/
+
+# Pre-compile so `docker run` is just `cargo test` against a warm
+# target dir.
+RUN cargo build --tests --release --locked
+
+CMD ["cargo", "test", "--release", "--locked", "--", "--nocapture"]
