@@ -12,8 +12,8 @@ are BlueZ-specific; everything else passes through unchanged.
 
 ## Use case
 
-You run two or more Bluetooth applications and want each to have exclusive
-use of one specific adapter on the host. Common reasons:
+You run two or more Bluetooth applications in containers and want each to
+have exclusive use of one specific adapter on the host. Common reasons:
 
 - One container scans for advertizements, another runs a BLE peripheral.
 - A development environment shouldn't see the adapter assigned to a
