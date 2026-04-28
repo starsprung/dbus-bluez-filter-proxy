@@ -15,7 +15,7 @@ are BlueZ-specific; everything else passes through unchanged.
 You run two or more Bluetooth applications in containers and want each to
 have exclusive use of one specific adapter on the host. Common reasons:
 
-- One container scans for advertizements, another runs a BLE peripheral.
+- One container scans for advertisements, another runs a BLE peripheral.
 - A development environment shouldn't see the adapter assigned to a
   production service running on the same machine.
 - A third-party tool enumerates `org.bluez` adapters and grabs the first one
