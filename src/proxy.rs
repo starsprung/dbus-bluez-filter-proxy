@@ -929,43 +929,77 @@ pub fn peer_uid(stream: &UnixStream) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
-    use zbus::zvariant::serialized::Context;
-    use zbus::zvariant::{to_bytes, Endian as ZEndian, ObjectPath, OwnedObjectPath, OwnedValue, Value};
+    use zbus::zvariant::Endian as ZEndian;
 
-    /// Construct a valid `a{oa{sa{sv}}}` body containing the given
-    /// (path, iface, prop_name, prop_value) tuples (one prop per
-    /// path) and wrap it in a minimal METHOD_RETURN header so it
-    /// can be fed to [`rewrite_gmo_reply`].
-    fn build_gmo_message(entries: &[(&str, &str, &str, u8)]) -> Vec<u8> {
-        // BTreeMap so iteration is sorted by key — required so the
-        // test asserts against a deterministic upstream byte order.
-        type Props = BTreeMap<String, OwnedValue>;
-        type Iface = BTreeMap<String, Props>;
-        type Gmo = BTreeMap<OwnedObjectPath, Iface>;
-        let mut gmo: Gmo = BTreeMap::new();
-        for (path, iface, name, val) in entries {
-            let mut props = BTreeMap::new();
-            props.insert(
-                (*name).to_owned(),
-                OwnedValue::try_from(Value::U8(*val)).unwrap(),
-            );
-            let mut ifs = BTreeMap::new();
-            ifs.insert((*iface).to_owned(), props);
-            let op: OwnedObjectPath = ObjectPath::try_from(*path).unwrap().into();
-            gmo.insert(op, ifs);
+    /// Build the bytes of one outer dict entry:
+    /// `{o = path, a{sa{sv}} = [{ "I" = a{sv} { "X" = byte(value) } }]}`.
+    /// `with_trailing_pad` controls whether the entry's bytes include
+    /// the 6 trailing pad bytes that 8-align the next entry — present
+    /// for non-last entries in the upstream body, absent for the
+    /// upstream-last entry.
+    ///
+    /// The fixture deliberately uses a 15-byte path and a single
+    /// byte-typed property so the entry's `inner_end` lands at a
+    /// non-8-aligned offset (50 bytes past the entry start), which
+    /// is what makes the trailing-pad bug observable.
+    fn build_entry(path: &str, value: u8, with_trailing_pad: bool) -> Vec<u8> {
+        assert_eq!(
+            path.len(),
+            15,
+            "test fixture hard-codes path length 15 for predictable alignment"
+        );
+        let mut e = Vec::with_capacity(56);
+        // Object path: u32 length, content, NUL.
+        e.extend_from_slice(&15u32.to_le_bytes());
+        e.extend_from_slice(path.as_bytes());
+        e.push(0);
+        // offset 20 within entry — already 4-aligned.
+        // Inner array `a{sa{sv}}`: u32 length, then 8-aligned content.
+        e.extend_from_slice(&26u32.to_le_bytes()); // inner array byte length
+                                                   // offset 24 — already 8-aligned.
+                                                   // One `{sa{sv}}`: iface name, then a{sv}.
+        e.extend_from_slice(&1u32.to_le_bytes()); // iface name length
+        e.push(b'I');
+        e.push(0); // NUL
+                   // offset 30 — pad to 4 for next u32.
+        e.extend_from_slice(&[0, 0]);
+        e.extend_from_slice(&10u32.to_le_bytes()); // props_len
+                                                   // offset 36 — pad to 8 for DICT_ENTRY of {sv}.
+        e.extend_from_slice(&[0, 0, 0, 0]);
+        // One `{sv}`: prop name, variant of byte.
+        e.extend_from_slice(&1u32.to_le_bytes()); // prop name length
+        e.push(b'X');
+        e.push(0); // NUL
+        e.push(1); // variant signature length
+        e.push(b'y'); // signature 'y'
+        e.push(0); // signature NUL
+        e.push(value); // byte value
+                       // Entry content ends here at offset 50. Total inner_array_len
+                       // is 50 - 24 = 26, matching the u32 written above.
+        if with_trailing_pad {
+            e.extend_from_slice(&[0; 6]);
         }
-        // Header occupies 16 bytes (no fields), so body starts at 16
-        // and the body's own internal alignment math agrees with a
-        // body-relative context of offset 0.
-        let encoded = to_bytes(Context::new_dbus(ZEndian::Little, 16), &gmo).expect("to_bytes");
-        let body: &[u8] = &encoded;
+        e
+    }
+
+    /// Wrap a sequence of entry-bytes into a valid
+    /// `a{oa{sa{sv}}}` GMO method-return message. The last entry
+    /// must be supplied without trailing pad — dbus ARRAY length
+    /// excludes pad after the last element.
+    fn build_gmo_message(entries: &[Vec<u8>]) -> Vec<u8> {
+        let array_len: usize = entries.iter().map(|e| e.len()).sum();
+        let mut body = Vec::with_capacity(8 + array_len);
+        body.extend_from_slice(&(array_len as u32).to_le_bytes());
+        body.extend_from_slice(&[0; 4]); // pad to 8 (DICT_ENTRY align)
+        for e in entries {
+            body.extend_from_slice(e);
+        }
         let mut msg = Vec::with_capacity(16 + body.len());
         msg.extend_from_slice(&[b'l', 2 /* METHOD_RETURN */, 0, 1]);
         msg.extend_from_slice(&(body.len() as u32).to_le_bytes());
         msg.extend_from_slice(&1u32.to_le_bytes()); // serial
         msg.extend_from_slice(&0u32.to_le_bytes()); // fields_array_length
-        msg.extend_from_slice(body);
+        msg.extend_from_slice(&body);
         msg
     }
 
@@ -987,9 +1021,9 @@ mod tests {
         // entry's 8-aligned start), so the rewriter has 6 bytes
         // of trailing pad to potentially leak into array_len.
         let upstream = build_gmo_message(&[
-            ("/org/bluez/hci0", "I", "X", 0x10),
-            ("/org/bluez/hci1", "I", "X", 0x11),
-            ("/org/bluez/hci2", "I", "X", 0x12),
+            build_entry("/org/bluez/hci0", 0x10, true),
+            build_entry("/org/bluez/hci1", 0x11, true),
+            build_entry("/org/bluez/hci2", 0x12, false), // upstream last: no trailing pad
         ]);
         let filter = FilterConfig {
             bluez_allowed_adapter_paths: vec!["/org/bluez/hci1".into()],
@@ -1043,8 +1077,8 @@ mod tests {
     #[test]
     fn rewrite_gmo_keeps_correct_length_when_last_entry_kept() {
         let upstream = build_gmo_message(&[
-            ("/org/bluez/hci0", "I", "X", 0x10),
-            ("/org/bluez/hci1", "I", "X", 0x11),
+            build_entry("/org/bluez/hci0", 0x10, true),
+            build_entry("/org/bluez/hci1", 0x11, false), // upstream last: no trailing pad
         ]);
         let filter = FilterConfig {
             bluez_allowed_adapter_paths: vec!["/org/bluez/hci1".into()],
