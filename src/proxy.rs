@@ -521,15 +521,31 @@ fn rewrite_gmo_reply(msg_bytes: &[u8], filter: &FilterConfig) -> anyhow::Result<
     let mut new_body = Vec::with_capacity(body.len());
     new_body.extend_from_slice(&body[..array_data_start]);
 
-    let mut new_array_len: usize = 0;
-    for (entry_start, entry_end, path) in &entries {
+    // `entry_end` for non-last upstream entries includes the
+    // 8-align pad bytes between this entry and the next, which
+    // dbus's ARRAY length counts as inter-element padding. For the
+    // upstream-last entry, `entry_end == array_data_end` (no
+    // trailing pad). When filtering drops the upstream-last entry
+    // and a previously-non-last entry becomes the new last, its
+    // trailing pad must NOT count toward `new_array_len` — dbus
+    // ARRAY length excludes padding *after* the last element.
+    // Track each kept entry's content end (`inner_end`) so the
+    // splice can drop the new-last entry's trailing pad.
+    let mut last_inner_end_in_new: Option<usize> = None;
+    for (entry_start, entry_end, inner_end, path) in &entries {
         if !filter.is_path_visible(path) {
             continue;
         }
-        let entry_bytes = &body[*entry_start..*entry_end];
-        new_body.extend_from_slice(entry_bytes);
-        new_array_len += entry_end - entry_start;
+        let pre_len = new_body.len();
+        new_body.extend_from_slice(&body[*entry_start..*entry_end]);
+        // `inner_end <= entry_end`; offset by the same amount they
+        // were apart in the source body.
+        last_inner_end_in_new = Some(pre_len + (inner_end - entry_start));
     }
+    if let Some(end) = last_inner_end_in_new {
+        new_body.truncate(end);
+    }
+    let new_array_len = new_body.len() - array_data_start;
 
     // Patch the outer array length (the uint32 at body[0..4]).
     let arr_len_bytes = (new_array_len as u32).to_ne_bytes_endian(endian);
@@ -548,16 +564,25 @@ fn rewrite_gmo_reply(msg_bytes: &[u8], filter: &FilterConfig) -> anyhow::Result<
 }
 
 /// Walk the outer dict of a GetManagedObjects body and return one
-/// `(start, end, path)` tuple per top-level entry. `start..end` are
-/// **byte ranges within the body** that include the entry's content
-/// AND its trailing alignment padding (i.e. through to the next
-/// entry's 8-aligned start, or the array's end for the last entry).
-/// Copying these ranges contiguously into a new buffer preserves
-/// inter-entry struct alignment.
+/// `(entry_start, entry_end, inner_end, path)` tuple per top-level
+/// entry. All offsets are **byte offsets within the body**.
+/// * `entry_start..entry_end` is the entry's full byte range
+///   including any trailing alignment padding (i.e. through to the
+///   next entry's 8-aligned start, or the array's end for the last
+///   entry). Copying these ranges contiguously preserves inter-
+///   entry struct alignment.
+/// * `inner_end` is where the entry's actual content ends, i.e.
+///   the end of the inner `a{sa{sv}}` array's payload, before any
+///   trailing alignment pad. For the upstream-last entry,
+///   `inner_end == entry_end`. For non-last entries `inner_end`
+///   may be < `entry_end` by 1..7 bytes of dict-entry padding.
+///   Splicers need this to know how much of the new last kept
+///   entry to keep (the trailing pad must be trimmed because dbus
+///   ARRAY length does not count pad after the last element).
 fn parse_outer_dict_entries(
     body: &[u8],
     endian: zbus::zvariant::Endian,
-) -> Result<Vec<(usize, usize, String)>, &'static str> {
+) -> Result<Vec<(usize, usize, usize, String)>, &'static str> {
     if body.len() < 4 {
         return Err("body shorter than outer-array length field");
     }
@@ -624,12 +649,13 @@ fn parse_outer_dict_entries(
         // for the last entry. Including trailing padding in the
         // copied range is what preserves struct alignment when
         // splicing entries.
+        let inner_end_offset = cursor;
         let entry_end = if cursor >= array_data_end {
             array_data_end
         } else {
             align8(cursor).min(array_data_end)
         };
-        entries.push((entry_start, entry_end, path));
+        entries.push((entry_start, entry_end, inner_end_offset, path));
         cursor = entry_end;
     }
     Ok(entries)
@@ -898,4 +924,142 @@ pub fn peer_uid(stream: &UnixStream) -> Result<u32> {
     let fd = unsafe { BorrowedFd::borrow_raw(stream.as_raw_fd()) };
     let cred = getsockopt(&fd, PeerCredentials).context("SO_PEERCRED")?;
     Ok(cred.uid())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use zbus::zvariant::serialized::Context;
+    use zbus::zvariant::{to_bytes, Endian as ZEndian, ObjectPath, OwnedObjectPath, OwnedValue, Value};
+
+    /// Construct a valid `a{oa{sa{sv}}}` body containing the given
+    /// (path, iface, prop_name, prop_value) tuples (one prop per
+    /// path) and wrap it in a minimal METHOD_RETURN header so it
+    /// can be fed to [`rewrite_gmo_reply`].
+    fn build_gmo_message(entries: &[(&str, &str, &str, u8)]) -> Vec<u8> {
+        // BTreeMap so iteration is sorted by key — required so the
+        // test asserts against a deterministic upstream byte order.
+        type Props = BTreeMap<String, OwnedValue>;
+        type Iface = BTreeMap<String, Props>;
+        type Gmo = BTreeMap<OwnedObjectPath, Iface>;
+        let mut gmo: Gmo = BTreeMap::new();
+        for (path, iface, name, val) in entries {
+            let mut props = BTreeMap::new();
+            props.insert(
+                (*name).to_owned(),
+                OwnedValue::try_from(Value::U8(*val)).unwrap(),
+            );
+            let mut ifs = BTreeMap::new();
+            ifs.insert((*iface).to_owned(), props);
+            let op: OwnedObjectPath = ObjectPath::try_from(*path).unwrap().into();
+            gmo.insert(op, ifs);
+        }
+        // Header occupies 16 bytes (no fields), so body starts at 16
+        // and the body's own internal alignment math agrees with a
+        // body-relative context of offset 0.
+        let encoded = to_bytes(Context::new_dbus(ZEndian::Little, 16), &gmo).expect("to_bytes");
+        let body: &[u8] = &encoded;
+        let mut msg = Vec::with_capacity(16 + body.len());
+        msg.extend_from_slice(&[b'l', 2 /* METHOD_RETURN */, 0, 1]);
+        msg.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        msg.extend_from_slice(&1u32.to_le_bytes()); // serial
+        msg.extend_from_slice(&0u32.to_le_bytes()); // fields_array_length
+        msg.extend_from_slice(body);
+        msg
+    }
+
+    /// Regression test for the trailing-pad bug: when the filter
+    /// drops the upstream-last entry and a previously-non-last
+    /// entry becomes the new last, the rewriter must NOT include
+    /// that entry's inter-element pad bytes in the new ARRAY
+    /// length. The dbus spec excludes padding *after* the last
+    /// element from `ARRAY` length, and strict parsers (sd-bus,
+    /// dbus-fast, jeepney) reject bodies that include it — they
+    /// loop one extra time and read past the body.
+    #[test]
+    fn rewrite_gmo_trims_trailing_pad_when_last_entry_dropped() {
+        // Three bluez paths sorted as hci0 < hci1 < hci2 by
+        // BTreeMap. The filter allows only `hci1`, dropping the
+        // first and last upstream entries. `hci1`'s entry happens
+        // to end at a non-8-aligned inner-array offset (its single
+        // byte-typed property leaves inner_end at +50 from the
+        // entry's 8-aligned start), so the rewriter has 6 bytes
+        // of trailing pad to potentially leak into array_len.
+        let upstream = build_gmo_message(&[
+            ("/org/bluez/hci0", "I", "X", 0x10),
+            ("/org/bluez/hci1", "I", "X", 0x11),
+            ("/org/bluez/hci2", "I", "X", 0x12),
+        ]);
+        let filter = FilterConfig {
+            bluez_allowed_adapter_paths: vec!["/org/bluez/hci1".into()],
+        };
+        let out = rewrite_gmo_reply(&upstream, &filter).expect("rewrite");
+
+        let body_start = align8(wire::FIXED_HEADER_LEN);
+        let new_body = &out[body_start..];
+        let endian = ZEndian::Little;
+        let array_len = read_u32_at(new_body, 0, endian) as usize;
+        let array_data_start = align8(4);
+        let array_data_end = array_data_start + array_len;
+
+        let kept = parse_outer_dict_entries(new_body, endian).expect("parse outer");
+        assert_eq!(
+            kept.len(),
+            1,
+            "filter should leave exactly one entry, got {kept:?}"
+        );
+        let (_es, _ee, inner_end, path) = &kept[0];
+        assert_eq!(path, "/org/bluez/hci1");
+
+        // The core spec invariant: the array's content boundary
+        // must land exactly at the new last entry's content end.
+        // Pre-fix, this fails by 1..7 bytes (the trailing pad).
+        assert_eq!(
+            array_data_end, *inner_end,
+            "new ARRAY length must NOT include trailing pad after the new last entry \
+             (array_data_end={array_data_end}, last entry inner_end={inner_end})"
+        );
+
+        // body_length in the fixed header must agree.
+        let body_len = read_u32_at(&out, 4, endian) as usize;
+        assert_eq!(
+            body_len,
+            new_body.len(),
+            "body_length header field must match actual body length"
+        );
+        assert_eq!(
+            body_len, array_data_end,
+            "body_length must equal array_data_end for an `a{{oa{{sa{{sv}}}}}}` body \
+             (no trailing pad in the body either)"
+        );
+    }
+
+    /// Sanity check the other direction: when the kept-last entry
+    /// IS the upstream-last entry, the rewriter's output is
+    /// already correct — no trailing pad to trim — and the result
+    /// is still well-formed. Guards against the fix accidentally
+    /// over-trimming.
+    #[test]
+    fn rewrite_gmo_keeps_correct_length_when_last_entry_kept() {
+        let upstream = build_gmo_message(&[
+            ("/org/bluez/hci0", "I", "X", 0x10),
+            ("/org/bluez/hci1", "I", "X", 0x11),
+        ]);
+        let filter = FilterConfig {
+            bluez_allowed_adapter_paths: vec!["/org/bluez/hci1".into()],
+        };
+        let out = rewrite_gmo_reply(&upstream, &filter).expect("rewrite");
+        let body_start = align8(wire::FIXED_HEADER_LEN);
+        let new_body = &out[body_start..];
+        let endian = ZEndian::Little;
+        let array_len = read_u32_at(new_body, 0, endian) as usize;
+        let array_data_end = align8(4) + array_len;
+
+        let kept = parse_outer_dict_entries(new_body, endian).expect("parse outer");
+        assert_eq!(kept.len(), 1);
+        let (_es, _ee, inner_end, path) = &kept[0];
+        assert_eq!(path, "/org/bluez/hci1");
+        assert_eq!(array_data_end, *inner_end);
+    }
 }
