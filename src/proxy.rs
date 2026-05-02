@@ -56,14 +56,16 @@
 //! Per-client failures don't tear down the listener; one bad client
 //! disconnects and we keep accepting.
 
+use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, error, info};
 
+use crate::fdstream::FdStream;
 use crate::filter::{Decision, FilterConfig, MethodCallInfo};
 use crate::introspect;
 use crate::wire::{self, MessageType};
@@ -171,21 +173,69 @@ async fn handle_client(mut client: UnixStream, cfg: Arc<ProxyConfig>) -> Result<
     }
     info!("SASL handshake forwarded (peer uid {})", cfg.peer_uid);
 
+    // Convert each tokio UnixStream into an FdStream so the
+    // message-aware relay can use recvmsg/sendmsg (and therefore
+    // preserve SCM_RIGHTS ancillary data carrying file descriptors).
+    // Plain tokio reads silently discard ancillary data — which
+    // would drop the FDs BlueZ returns from AcquireWrite /
+    // AcquireNotify, so bleak's GATT fast path needs this.
+    let client_std = client
+        .into_std()
+        .context("convert tokio client UnixStream to std")?;
+    let upstream_std = upstream
+        .into_std()
+        .context("convert tokio upstream UnixStream to std")?;
+    // tokio::net::UnixStream::into_std() doesn't guarantee O_NONBLOCK
+    // survives the conversion. AsyncFd assumes nonblocking, so set
+    // it explicitly here.
+    client_std
+        .set_nonblocking(true)
+        .context("set_nonblocking on client std stream")?;
+    upstream_std
+        .set_nonblocking(true)
+        .context("set_nonblocking on upstream std stream")?;
+    let c_stream = std::sync::Arc::new(
+        FdStream::new(client_std.into()).context("wrap client fd in FdStream")?,
+    );
+    let u_stream = std::sync::Arc::new(
+        FdStream::new(upstream_std.into()).context("wrap upstream fd in FdStream")?,
+    );
+    // Per-side send locks. SOCK_STREAM `sendmsg` is not atomic for
+    // arbitrary-sized writes — two concurrent senders on the same
+    // socket can interleave bytes mid-message, which the receiver
+    // would then misparse as garbage. The lock guarantees each
+    // logical message (its bytes + paired FDs) goes out atomically.
+    // c-send is shared by both relay tasks (forwarding + deny-replies);
+    // u-send only relay_c2u writes to it, but a lock keeps the API
+    // symmetrical and cheap.
+    let c_send = Sender {
+        stream: std::sync::Arc::clone(&c_stream),
+        lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+    };
+    let u_send = Sender {
+        stream: std::sync::Arc::clone(&u_stream),
+        lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+    };
+
     // Hand the carryover bytes (anything past BEGIN that came in the
     // same syscall — common with sd-bus's pipelined fast-path) to
-    // upstream before starting the message-aware relay.
+    // upstream before starting the message-aware relay. The SASL
+    // forwarder didn't request ancillary data, so any FDs the client
+    // pipelined alongside its first message would be lost — but no
+    // standard client pipelines FD-bearing messages with the SASL
+    // handshake (FDs are GATT-fast-path territory, post-Hello).
     if !carryover.is_empty() {
-        upstream
-            .write_all(&carryover)
+        u_send
+            .send_all(&carryover, &[])
             .await
-            .context("forward carryover to upstream")?;
+            .context("forward SASL carryover to upstream")?;
     }
 
     // Both directions are message-aware.
     //
     // c2u (client -> upstream): read full messages, parse headers,
     // ask the filter; forward, or synthesize an AccessDenied reply
-    // back to the client (writes to cw under a lock shared with u2c).
+    // back to the client.
     //
     // u2c (upstream -> client): same shape; on a `GetManagedObjects`
     // method_return whose reply_serial we tracked, parse the body
@@ -199,18 +249,17 @@ async fn handle_client(mut client: UnixStream, cfg: Arc<ProxyConfig>) -> Result<
     let inflight = std::sync::Arc::new(tokio::sync::Mutex::new(
         std::collections::HashMap::<u32, TrackedCall>::new(),
     ));
-    let (mut cr, cw) = client.into_split();
-    let cw_arc = std::sync::Arc::new(tokio::sync::Mutex::new(cw));
-    let (mut ur, mut uw) = upstream.into_split();
 
-    let cw_for_c2u = std::sync::Arc::clone(&cw_arc);
+    let c_stream_for_c2u = std::sync::Arc::clone(&c_stream);
+    let u_send_for_c2u = u_send.clone();
+    let c_send_for_c2u = c_send.clone();
     let inflight_for_c2u = std::sync::Arc::clone(&inflight);
     let filter_for_c2u = filter.clone();
     let c2u = tokio::spawn(async move {
         relay_c2u(
-            &mut cr,
-            &mut uw,
-            cw_for_c2u,
+            c_stream_for_c2u,
+            u_send_for_c2u,
+            c_send_for_c2u,
             inflight_for_c2u,
             &filter_for_c2u,
             debug,
@@ -218,9 +267,9 @@ async fn handle_client(mut client: UnixStream, cfg: Arc<ProxyConfig>) -> Result<
         .await
     });
 
-    let cw_for_u2c = std::sync::Arc::clone(&cw_arc);
+    let u_stream_for_u2c = std::sync::Arc::clone(&u_stream);
     let u2c = tokio::spawn(async move {
-        relay_u2c(&mut ur, cw_for_u2c, inflight, &filter, debug).await
+        relay_u2c(u_stream_for_u2c, c_send, inflight, &filter, debug).await
     });
 
     tokio::select! {
@@ -230,22 +279,46 @@ async fn handle_client(mut client: UnixStream, cfg: Arc<ProxyConfig>) -> Result<
     Ok(())
 }
 
+/// Locked send half of an [`FdStream`]. `Clone` produces a new
+/// handle to the same socket and the same lock — multiple tasks
+/// sharing one `Sender` will serialize their `send_all` calls.
+#[derive(Clone)]
+struct Sender {
+    stream: std::sync::Arc<FdStream>,
+    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Sender {
+    async fn send_all(
+        &self,
+        buf: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> std::io::Result<()> {
+        let _g = self.lock.lock().await;
+        self.stream.send_all(buf, fds).await
+    }
+}
+
 /// Message-aware client -> upstream relay.
 ///
-/// The cw lock is shared with u2c so error-reply synthesis (which
-/// writes to cw) can't collide with normal upstream-sourced writes.
 /// `inflight` records outgoing method-call serials whose replies
 /// the proxy needs to rewrite or post-process — `GetManagedObjects`
 /// (subtree splice) and `Introspect` (XML node strip).
+///
+/// FDs delivered alongside any message ride through to upstream as
+/// `SCM_RIGHTS` ancillary data, paired with their original message's
+/// bytes. Denied calls' FDs are dropped (closed) here.
 async fn relay_c2u(
-    cr: &mut tokio::net::unix::OwnedReadHalf,
-    uw: &mut tokio::net::unix::OwnedWriteHalf,
-    cw: std::sync::Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    c_stream: std::sync::Arc<FdStream>,
+    u_send: Sender,
+    c_send: Sender,
     inflight: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<u32, TrackedCall>>>,
     filter: &FilterConfig,
     debug: bool,
 ) -> std::io::Result<()> {
     let mut accum: Vec<u8> = Vec::with_capacity(4096);
+    let mut accum_fds: std::collections::VecDeque<std::os::fd::OwnedFd> =
+        std::collections::VecDeque::new();
     let mut tmp = [0u8; 4096];
     loop {
         // Make sure we have at least one full message in `accum`.
@@ -262,11 +335,12 @@ async fn relay_c2u(
                     }
                 }
             }
-            let n = cr.read(&mut tmp).await?;
+            let (n, fds) = c_stream.recv(&mut tmp).await?;
             if n == 0 {
                 return Ok(());
             }
             accum.extend_from_slice(&tmp[..n]);
+            accum_fds.extend(fds);
         };
 
         let msg_bytes: Vec<u8> = accum.drain(..total_len).collect();
@@ -276,10 +350,17 @@ async fn relay_c2u(
                 if debug {
                     eprintln!("[proxy] c->u parse err: {e}; forwarding raw");
                 }
-                uw.write_all(&msg_bytes).await?;
+                u_send.send_all(&msg_bytes, &[]).await?;
                 continue;
             }
         };
+
+        // Take this message's fds off the front of the queue. dbus's
+        // SASL pairs SCM_RIGHTS with the first byte of the sendmsg
+        // that contains the message; receiver-side, we accumulate
+        // FDs in arrival order and consume `unix_fds` worth per
+        // message header.
+        let fds_for_msg = take_fds(&mut accum_fds, header.unix_fds as usize, debug, "c2u");
 
         match header.msg_type {
             MessageType::MethodCall => {
@@ -326,7 +407,9 @@ async fn relay_c2u(
                                 inflight.lock().await.insert(header.serial, k);
                             }
                         }
-                        uw.write_all(&msg_bytes).await?;
+                        let borrowed: Vec<std::os::fd::BorrowedFd> =
+                            fds_for_msg.iter().map(|f| f.as_fd()).collect();
+                        u_send.send_all(&msg_bytes, &borrowed).await?;
                     }
                     Decision::DenyMethodCall { .. } => {
                         if debug {
@@ -337,9 +420,11 @@ async fn relay_c2u(
                                 header.member.as_deref().unwrap_or("")
                             );
                         }
+                        // The denied call's FDs are dropped here:
+                        // `fds_for_msg` goes out of scope at the end
+                        // of this match arm and the OwnedFds close.
                         let reply = build_access_denied_error(&msg_bytes)?;
-                        let mut g = cw.lock().await;
-                        g.write_all(&reply).await?;
+                        c_send.send_all(&reply, &[]).await?;
                     }
                 }
             }
@@ -347,10 +432,41 @@ async fn relay_c2u(
                 // Method returns / errors / signals from the client
                 // pass through untouched; the filter rules only
                 // apply to upstream-sourced traffic on the return path.
-                uw.write_all(&msg_bytes).await?;
+                let borrowed: Vec<std::os::fd::BorrowedFd> =
+                    fds_for_msg.iter().map(|f| f.as_fd()).collect();
+                u_send.send_all(&msg_bytes, &borrowed).await?;
             }
         }
     }
+}
+
+/// Pop `n` FDs off the front of a recv-side queue. Logs on debug if
+/// the queue is short of what the message claims (would mean the
+/// peer mis-counted UNIX_FDS, or a previous recvmsg got a control-
+/// buffer overflow). The returned `Vec` owns its FDs; dropping it
+/// closes them.
+fn take_fds(
+    queue: &mut std::collections::VecDeque<std::os::fd::OwnedFd>,
+    n: usize,
+    debug: bool,
+    dir: &str,
+) -> Vec<std::os::fd::OwnedFd> {
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        match queue.pop_front() {
+            Some(f) => out.push(f),
+            None => {
+                if debug {
+                    eprintln!(
+                        "[proxy] {dir} message claims {n} fds but only {} available",
+                        out.len()
+                    );
+                }
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Message-aware upstream -> client relay.
@@ -363,14 +479,21 @@ async fn relay_c2u(
 ///     argument; if the path falls outside the filter's allow list,
 ///     drop the message entirely.
 ///   * Anything else: forward verbatim.
+///
+/// FDs from upstream (e.g. `AcquireWrite`/`AcquireNotify` GATT
+/// fast-path returns) ride along to the client as `SCM_RIGHTS`
+/// ancillary data paired with their original message. Dropped
+/// signals' FDs are closed.
 async fn relay_u2c(
-    ur: &mut tokio::net::unix::OwnedReadHalf,
-    cw: std::sync::Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    u_stream: std::sync::Arc<FdStream>,
+    c_send: Sender,
     inflight: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<u32, TrackedCall>>>,
     filter: &FilterConfig,
     debug: bool,
 ) -> std::io::Result<()> {
     let mut accum: Vec<u8> = Vec::with_capacity(4096);
+    let mut accum_fds: std::collections::VecDeque<std::os::fd::OwnedFd> =
+        std::collections::VecDeque::new();
     let mut tmp = [0u8; 4096];
     loop {
         let total_len = loop {
@@ -386,11 +509,12 @@ async fn relay_u2c(
                     }
                 }
             }
-            let n = ur.read(&mut tmp).await?;
+            let (n, fds) = u_stream.recv(&mut tmp).await?;
             if n == 0 {
                 return Ok(());
             }
             accum.extend_from_slice(&tmp[..n]);
+            accum_fds.extend(fds);
         };
 
         let msg_bytes: Vec<u8> = accum.drain(..total_len).collect();
@@ -400,10 +524,16 @@ async fn relay_u2c(
                 if debug {
                     eprintln!("[proxy] u->c parse err: {e}; forwarding raw");
                 }
-                cw.lock().await.write_all(&msg_bytes).await?;
+                c_send.send_all(&msg_bytes, &[]).await?;
                 continue;
             }
         };
+
+        // Take this message's FDs whether or not we're going to
+        // forward it — that keeps `accum_fds` aligned with the
+        // remaining byte stream. Dropped messages' FDs are closed
+        // when `fds_for_msg` falls out of scope below.
+        let fds_for_msg = take_fds(&mut accum_fds, header.unix_fds as usize, debug, "u2c");
 
         let out_bytes: Option<Vec<u8>> = match header.msg_type {
             MessageType::MethodReturn => {
@@ -506,8 +636,12 @@ async fn relay_u2c(
         };
 
         if let Some(b) = out_bytes {
-            cw.lock().await.write_all(&b).await?;
+            let borrowed: Vec<std::os::fd::BorrowedFd> =
+                fds_for_msg.iter().map(|f| f.as_fd()).collect();
+            c_send.send_all(&b, &borrowed).await?;
         }
+        // `fds_for_msg` drops here. If the message was dropped
+        // (`out_bytes == None`) its FDs close along with it.
     }
 }
 
