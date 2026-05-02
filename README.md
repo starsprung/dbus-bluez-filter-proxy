@@ -277,9 +277,9 @@ BlueZ-capable kernel for the HCI ioctls used to resolve adapter MACs.
 ## Tests
 
 ```sh
-./run-tests.sh              # full suite in a Docker container
-./run-tests.sh --test auth  # one suite
-cargo test                  # locally (needs the build deps above)
+./run-tests.sh                    # full suite in a Docker container
+./run-tests.sh --test passthrough # one suite
+cargo test                        # locally (needs the build deps above)
 ```
 
 The container test setup spins up a real `dbus-daemon` and a stub `org.bluez`
@@ -290,8 +290,7 @@ filter pipeline against a working bus.
 
 | Path | Notes |
 |---|---|
-| `src/proxy.rs` | Async relay: splice loop, call tracking, GMO/Introspect rewriting |
-| `src/auth.rs` | SASL FSM supporting both libdbus and sd-bus fast-path flows |
+| `src/proxy.rs` | Async relay: splice loop, call tracking, GMO/Introspect rewriting; SASL phase forwards bytes verbatim between client and upstream |
 | `src/filter.rs` | BlueZ filter rules (adapter visibility, method-call policy) |
 | `src/wire.rs` | D-Bus wire message header parser |
 | `src/introspect.rs` | Streaming XML filter for Introspect responses |
