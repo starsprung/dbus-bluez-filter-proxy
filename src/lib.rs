@@ -22,11 +22,13 @@
 //! or call on the `org.bluez` service so a container can be scoped to
 //! a single Bluetooth adapter without leaking visibility of others.
 //!
-//! Compatible with both the standard SASL handshake flow and sd-bus's
-//! pipelined "fast path" — `busctl`, `gdbus`, `dbus-send`, libdbus,
-//! and zbus/dbus-next clients all work through it.
+//! Compatible with the standard SASL handshake flow, sd-bus's
+//! pipelined "fast path", and clients that negotiate FD passing
+//! (libdbus, sd-bus/`busctl`, gdbus, zbus, dbus-fast/`bleak`) — the
+//! proxy forwards SASL bytes between client and upstream verbatim
+//! during the handshake, so whatever the upstream daemon supports is
+//! what the client sees.
 
-pub mod auth;
 pub mod filter;
 pub mod hci;
 pub mod introspect;

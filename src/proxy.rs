@@ -15,25 +15,43 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 //! TCP-style relay between a downstream client and an upstream
-//! D-Bus daemon, with the SASL handshake mediated by [`crate::auth`].
+//! D-Bus daemon, with a transparent SASL phase.
 //!
 //! Lifecycle of a client:
 //!   1. Accept on the listen socket.
-//!   2. Read kernel-attested peer uid via SO_PEERCRED.
-//!   3. Run [`AuthFsm`] over inbound bytes until `Accept` is emitted.
-//!      Send any reply bytes the FSM produces back to the client.
-//!   4. Connect to the upstream socket. Run an outbound SASL exchange
-//!      against the upstream bus (the proxy is a client there) and
-//!      consume the upstream's `OK <guid>\r\n` reply so it never
-//!      reaches the downstream client.
-//!   5. Forward the FSM's `carryover` bytes (anything that came in
-//!      after `BEGIN` in the same syscall — common with sd-bus's
-//!      pipelined fast-path) to the upstream.
+//!   2. Read kernel-attested peer uid via SO_PEERCRED. Reject early
+//!      if it doesn't match the configured `peer_uid` — guards
+//!      against another local user dialling the proxy socket.
+//!   3. Connect to the upstream socket and send `\0` plus
+//!      `SCM_CREDENTIALS` carrying the proxy's own creds (libdbus
+//!      convention; dbus-daemon validates the ancillary creds against
+//!      its allow-list before any AUTH bytes are read).
+//!   4. Consume — and drop — the leading `\0` byte the downstream
+//!      client must send. Its purpose is to ride along with peer
+//!      credentials, but those credentials terminate at the proxy;
+//!      upstream sees the proxy's creds, set in step 3, instead.
+//!   5. Run a bidirectional byte-shuttle between client and upstream.
+//!      Forward each `\r\n`-terminated SASL line verbatim in both
+//!      directions until the line `BEGIN\r\n` is seen from the
+//!      client. That line is forwarded too; anything in the same
+//!      buffer past `BEGIN\r\n` is the post-SASL carryover (sd-bus's
+//!      pipelined fast-path packs `BEGIN` and the first message into
+//!      one syscall).
 //!   6. Spawn two tasks: client→upstream and upstream→client. Each
 //!      task parses message headers so the BlueZ filter rules can
 //!      apply (method-call denial, GMO/Introspect response rewriting,
 //!      signal filtering); message bodies that aren't being rewritten
 //!      pass through untouched.
+//!
+//! Why transparent SASL forwarding rather than re-implementing the
+//! handshake locally: the SASL `OK <guid>` line carries the upstream
+//! daemon's bus GUID, and `NEGOTIATE_UNIX_FD` negotiates a real
+//! capability between client and daemon. Re-implementing locally
+//! means inventing a fake GUID and choosing a hard-coded answer to
+//! `NEGOTIATE_UNIX_FD` that may not match upstream's truth — strict
+//! clients (dbus-fast, used by `bleak`) treat any reply other than
+//! `AGREE_UNIX_FD` as auth failure, so a hard-coded `ERROR` breaks
+//! them outright. Forwarding keeps upstream's answers authoritative.
 //!
 //! Per-client failures don't tear down the listener; one bad client
 //! disconnects and we keep accepting.
@@ -46,7 +64,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, error, info};
 
-use crate::auth::{Accept, Action, AuthFsm};
 use crate::filter::{Decision, FilterConfig, MethodCallInfo};
 use crate::introspect;
 use crate::wire::{self, MessageType};
@@ -60,13 +77,6 @@ enum TrackedCall {
     GetManagedObjects,
     Introspect { object_path: String },
 }
-
-/// Server GUID advertised in the SASL `OK <guid>` line.
-///
-/// D-Bus clients don't validate this against any registry; it's an
-/// identifier for the bus. We pick a stable value for the proxy so
-/// cross-client behaviour is reproducible.
-const PROXY_GUID: &str = "0123456789abcdef0123456789abcdef";
 
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
@@ -123,31 +133,47 @@ impl Proxy {
 }
 
 async fn handle_client(mut client: UnixStream, cfg: Arc<ProxyConfig>) -> Result<()> {
-    // Run downstream SASL.
-    let mut fsm = AuthFsm::new(cfg.peer_uid, PROXY_GUID);
-    let carryover = downstream_handshake(&mut client, &mut fsm).await?;
-    if std::env::var("DBUS_FILTER_PROXY_DEBUG").is_ok() {
-        eprintln!("[proxy] downstream SASL ok, carryover len={}", carryover.len());
+    // Validate peer uid via SO_PEERCRED before any bytes flow. Done
+    // here rather than as part of SASL because the SASL phase is
+    // forwarded transparently to upstream — this is the proxy's only
+    // independent authorization decision.
+    let observed_uid = peer_uid(&client).context("read SO_PEERCRED on client socket")?;
+    if observed_uid != cfg.peer_uid {
+        anyhow::bail!(
+            "peer uid mismatch: SO_PEERCRED reports {observed_uid}, configured {}",
+            cfg.peer_uid
+        );
     }
-    info!("downstream SASL accepted (peer uid {})", cfg.peer_uid);
 
-    // Connect upstream + do SASL synchronously on a std stream
-    // (sendmsg with SCM_CREDENTIALS is sync-friendly), then hand
-    // the fd to tokio for the relay phase.
+    // Connect upstream and emit the proxy's own `\0` + SCM_CREDENTIALS
+    // greeting. dbus-daemon reads ancillary creds on the leading NUL
+    // and uses them as the kernel-attested identity for the
+    // upstream-side SASL EXTERNAL exchange.
     let upstream_path = cfg.upstream.clone();
-    let std_upstream = tokio::task::spawn_blocking(move || -> Result<std::os::unix::net::UnixStream> {
-        sync_upstream_handshake(&upstream_path)
-    })
-    .await
-    .context("spawn_blocking upstream handshake")??;
+    let std_upstream =
+        tokio::task::spawn_blocking(move || -> Result<std::os::unix::net::UnixStream> {
+            sync_connect_upstream_with_creds(&upstream_path)
+        })
+        .await
+        .context("spawn_blocking upstream connect")??;
     std_upstream.set_nonblocking(true).context("set nonblocking")?;
     let mut upstream = UnixStream::from_std(std_upstream)
         .context("std -> tokio UnixStream conversion")?;
-    debug!("upstream SASL completed");
 
-    // Hand the carryover bytes (post-BEGIN payload that came in the
-    // same syscall as the SASL lines) to upstream before starting
-    // the relay.
+    // Run the SASL phase transparently. Drops the client's leading
+    // NUL (the proxy already sent its own upstream), then byte-
+    // shuttles SASL lines until `BEGIN\r\n` is forwarded upstream.
+    let carryover = forward_sasl(&mut client, &mut upstream)
+        .await
+        .context("transparent SASL forwarding")?;
+    if std::env::var("DBUS_FILTER_PROXY_DEBUG").is_ok() {
+        eprintln!("[proxy] SASL forwarded, carryover len={}", carryover.len());
+    }
+    info!("SASL handshake forwarded (peer uid {})", cfg.peer_uid);
+
+    // Hand the carryover bytes (anything past BEGIN that came in the
+    // same syscall — common with sd-bus's pipelined fast-path) to
+    // upstream before starting the message-aware relay.
     if !carryover.is_empty() {
         upstream
             .write_all(&carryover)
@@ -811,59 +837,23 @@ fn build_access_denied_error(call_bytes: &[u8]) -> std::io::Result<Vec<u8>> {
     Ok(reply.data().to_vec())
 }
 
-/// Drive the downstream SASL FSM. Returns the post-BEGIN carryover.
-async fn downstream_handshake(client: &mut UnixStream, fsm: &mut AuthFsm) -> Result<Vec<u8>> {
-    let mut buf = [0u8; 4096];
-    let debug = std::env::var("DBUS_FILTER_PROXY_DEBUG").is_ok();
-    loop {
-        let n = client
-            .read(&mut buf)
-            .await
-            .context("read during SASL")?;
-        if n == 0 {
-            anyhow::bail!("client EOF during SASL");
-        }
-        if debug {
-            eprintln!("[proxy] downstream rx {n} bytes: {:?}", String::from_utf8_lossy(&buf[..n]));
-        }
-        match fsm.feed(&buf[..n]) {
-            Action::NeedMore => {}
-            Action::Send(reply) => client.write_all(&reply).await?,
-            Action::Accept(Accept { reply, carryover }) => {
-                client.write_all(&reply).await?;
-                return Ok(carryover);
-            }
-            Action::Reject(reason) => {
-                anyhow::bail!("SASL rejected: {reason}");
-            }
-        }
-    }
-}
-
-/// Synchronous upstream SASL handshake. Runs on a blocking thread
-/// because we need raw sendmsg(2) for the SCM_CREDENTIALS NUL byte
-/// that dbus-daemon expects, and mixing that with the tokio reactor
-/// is harder to keep correct than just doing it before handing the
-/// fd over to tokio.
-fn sync_upstream_handshake(path: &std::path::Path) -> Result<std::os::unix::net::UnixStream> {
+/// Connect to the upstream socket and send the leading `\0` byte
+/// with `SCM_CREDENTIALS` ancillary data carrying the proxy's own
+/// uid/gid/pid. dbus-daemon binds those creds to the connection and
+/// uses them as the kernel-attested identity for the SASL EXTERNAL
+/// exchange that follows. Synchronous because the standard
+/// `sendmsg(2)` API is sync-only and mixing raw `sendmsg` with the
+/// tokio reactor is brittle; we run on a blocking thread instead.
+fn sync_connect_upstream_with_creds(
+    path: &std::path::Path,
+) -> Result<std::os::unix::net::UnixStream> {
     use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags, UnixCredentials};
-    use std::io::{IoSlice, Read, Write};
+    use std::io::IoSlice;
     use std::os::fd::{AsRawFd, BorrowedFd};
 
-    let mut stream = std::os::unix::net::UnixStream::connect(path)
+    let stream = std::os::unix::net::UnixStream::connect(path)
         .with_context(|| format!("connect upstream {}", path.display()))?;
 
-    let our_uid = nix::unistd::geteuid().as_raw();
-    let hex_uid = hex::encode(our_uid.to_string());
-    let payload = format!("AUTH EXTERNAL {hex_uid}\r\nBEGIN\r\n");
-    let debug = std::env::var("DBUS_FILTER_PROXY_DEBUG").is_ok();
-    if debug {
-        eprintln!("[proxy] upstream tx (after creds NUL): {:?}", payload);
-    }
-
-    // Send NUL with SCM_CREDENTIALS — libdbus convention; dbus-daemon
-    // matches the ancillary creds against the SO_PEERCRED-derived
-    // identity to confirm the connection is from a legitimate peer.
     let creds = UnixCredentials::new();
     let nul = [0u8; 1];
     let iov = [IoSlice::new(&nul)];
@@ -873,50 +863,137 @@ fn sync_upstream_handshake(path: &std::path::Path) -> Result<std::os::unix::net:
     sendmsg::<()>(fd.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
         .context("sendmsg with SCM_CREDENTIALS")?;
 
-    stream
-        .write_all(payload.as_bytes())
-        .context("write upstream SASL")?;
+    Ok(stream)
+}
 
-    // Consume the `OK <guid>\r\n` reply so it doesn't bleed into the
-    // forwarded byte stream. We send only AUTH+BEGIN (no
-    // NEGOTIATE_UNIX_FD), so a single CRLF terminates the response.
-    let mut buf = [0u8; 256];
-    let mut acc = Vec::new();
+/// Bidirectional byte-shuttle covering the SASL phase. The upstream
+/// daemon's responses (`OK <guid>`, `AGREE_UNIX_FD`/`ERROR`, etc.)
+/// pass back to the client verbatim — strict clients like dbus-fast
+/// see exactly what they would from a direct connection.
+///
+/// The client→upstream direction is line-oriented so we can detect
+/// `BEGIN\r\n` and split SASL bytes from any post-`BEGIN` carryover
+/// that arrived in the same syscall (sd-bus pipelines `BEGIN` plus
+/// the first message). Bytes after `BEGIN\r\n` are returned to the
+/// caller, which feeds them to the message-aware relay.
+///
+/// The first byte from the client must be `\0` (D-Bus protocol
+/// requires it). We consume and discard it: the proxy already sent
+/// its own NUL+SCM_CREDENTIALS upstream, which is what binds the
+/// upstream-side SASL identity. Forwarding the client's NUL would
+/// have it parsed as either an extra leading-NUL (some daemons
+/// reject) or, after the SASL phase, as a stray byte ahead of the
+/// first message frame.
+///
+/// After `BEGIN\r\n` is forwarded the function does not return
+/// immediately: it tracks how many response-expecting commands were
+/// sent c→u (every command except `BEGIN`) and waits until upstream
+/// has produced one `\r\n`-terminated reply for each. Without that
+/// drain, a pipelined client (`\0AUTH…\r\nNEGOTIATE_UNIX_FD\r\nBEGIN\r\n`
+/// in one syscall) would race upstream's SASL replies into the
+/// message-aware relay, which would then misparse them as D-Bus
+/// message frames.
+async fn forward_sasl(
+    client: &mut UnixStream,
+    upstream: &mut UnixStream,
+) -> Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let debug = std::env::var("DBUS_FILTER_PROXY_DEBUG").is_ok();
+
+    // Consume — and drop — the client's mandatory leading NUL.
+    let mut nul = [0u8; 1];
+    client
+        .read_exact(&mut nul)
+        .await
+        .context("read client leading NUL")?;
+    if nul[0] != 0 {
+        anyhow::bail!(
+            "expected leading NUL byte from client, got 0x{:02x}",
+            nul[0]
+        );
+    }
+
+    let mut c2u_pending: Vec<u8> = Vec::with_capacity(256);
+    let mut u2c_pending: Vec<u8> = Vec::with_capacity(256);
+    let mut carryover: Vec<u8> = Vec::new();
+    // Each c→u line except BEGIN expects exactly one upstream reply
+    // line per the SASL spec. Track the imbalance so we know when
+    // the SASL phase is fully drained and the message-aware relay
+    // can take over without misparsing a stray reply.
+    let mut pending_replies: usize = 0;
+    let mut begin_sent = false;
+    // Separate buffers per direction: `tokio::select!` polls both
+    // futures and the borrow checker treats them as live concurrently
+    // even though only one wins. One buffer per arm sidesteps that.
+    let mut c2u_tmp = [0u8; 1024];
+    let mut u2c_tmp = [0u8; 1024];
+
     loop {
-        let n = stream.read(&mut buf).context("read upstream SASL reply")?;
-        if debug {
-            eprintln!(
-                "[proxy] upstream rx {n} bytes: {:?}",
-                String::from_utf8_lossy(&buf[..n])
-            );
+        if begin_sent && pending_replies == 0 {
+            return Ok(carryover);
         }
-        if n == 0 {
-            anyhow::bail!("upstream EOF during SASL");
-        }
-        acc.extend_from_slice(&buf[..n]);
-        if let Some(pos) = acc.windows(2).position(|w| w == b"\r\n") {
-            // Anything after the CRLF is message-stream bytes from
-            // upstream — should never happen in practice (dbus-daemon
-            // waits for the client's first message) but if it does,
-            // we lose them. Acceptable until shown otherwise.
-            let _trailing = acc.split_off(pos + 2);
-            if !acc.starts_with(b"OK ") {
-                anyhow::bail!("upstream rejected SASL: {:?}", String::from_utf8_lossy(&acc));
+        tokio::select! {
+            // Stop reading from the client once BEGIN has been
+            // forwarded — anything that arrives after is a message
+            // frame for the post-SASL relay to consume.
+            r = client.read(&mut c2u_tmp), if !begin_sent => {
+                let n = r.context("read from client during SASL")?;
+                if n == 0 {
+                    anyhow::bail!("client EOF during SASL");
+                }
+                if debug {
+                    eprintln!("[proxy] c->u SASL rx {n} bytes: {:?}", String::from_utf8_lossy(&c2u_tmp[..n]));
+                }
+                c2u_pending.extend_from_slice(&c2u_tmp[..n]);
+                // Pop complete `\r\n`-terminated lines and forward
+                // each one verbatim. `BEGIN` flips `begin_sent`; any
+                // bytes still buffered after it are carryover.
+                while let Some(crlf) = c2u_pending.windows(2).position(|w| w == b"\r\n") {
+                    let line_end = crlf + 2;
+                    upstream
+                        .write_all(&c2u_pending[..line_end])
+                        .await
+                        .context("forward SASL line to upstream")?;
+                    let is_begin = c2u_pending[..crlf] == *b"BEGIN";
+                    c2u_pending.drain(..line_end);
+                    if is_begin {
+                        begin_sent = true;
+                        carryover = std::mem::take(&mut c2u_pending);
+                        break;
+                    }
+                    pending_replies += 1;
+                }
             }
-            return Ok(stream);
+            r = upstream.read(&mut u2c_tmp) => {
+                let n = r.context("read from upstream during SASL")?;
+                if n == 0 {
+                    anyhow::bail!("upstream EOF during SASL");
+                }
+                if debug {
+                    eprintln!("[proxy] u->c SASL rx {n} bytes: {:?}", String::from_utf8_lossy(&u2c_tmp[..n]));
+                }
+                // Forward verbatim, but also count complete reply
+                // lines so we know when upstream has answered every
+                // outstanding command.
+                client
+                    .write_all(&u2c_tmp[..n])
+                    .await
+                    .context("forward SASL reply to client")?;
+                u2c_pending.extend_from_slice(&u2c_tmp[..n]);
+                while let Some(crlf) = u2c_pending.windows(2).position(|w| w == b"\r\n") {
+                    u2c_pending.drain(..crlf + 2);
+                    pending_replies = pending_replies.saturating_sub(1);
+                }
+            }
         }
     }
 }
 
-/// Look up the connecting peer's uid via SO_PEERCRED. Used by
-/// production callers to validate the SASL claim against kernel
-/// truth; tests pass the uid in via [`ProxyConfig`] directly because
-/// they connect as the same uid that runs the proxy.
-/// Look up the connecting peer's uid via SO_PEERCRED. Production
-/// callers will validate the SASL claim against this; the test
-/// harness pre-fills `peer_uid` because the test process IS the
-/// connecting client.
-#[allow(dead_code)]
+/// Look up the connecting peer's uid via `SO_PEERCRED`. The
+/// kernel-attested uid is the proxy's only independent authorization
+/// signal (the SASL handshake itself is forwarded transparently to
+/// upstream), so the value returned here is compared against
+/// [`ProxyConfig::peer_uid`] up front in [`handle_client`].
 pub fn peer_uid(stream: &UnixStream) -> Result<u32> {
     use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
     use std::os::fd::{AsRawFd, BorrowedFd};
