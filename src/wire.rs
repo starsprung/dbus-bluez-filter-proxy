@@ -78,6 +78,12 @@ pub struct Header {
     pub reply_serial: Option<u32>,
     pub destination: Option<String>,
     pub sender: Option<String>,
+    /// Number of file descriptors transferred with this message
+    /// (header field code 9, signature `u`). The FDs themselves
+    /// arrive as `SCM_RIGHTS` ancillary data; the proxy uses this
+    /// count to pair each forwarded message with the right FDs.
+    /// Absent / zero for messages without FD passing.
+    pub unix_fds: u32,
 }
 
 impl Header {
@@ -148,6 +154,7 @@ pub fn parse(bytes: &[u8]) -> Result<Header> {
         reply_serial: None,
         destination: None,
         sender: None,
+        unix_fds: 0,
     };
     parse_fields(endian, &bytes[FIXED_HEADER_LEN..fields_end], &mut header)?;
     Ok(header)
@@ -262,8 +269,10 @@ fn parse_fields(endian: Endian, bytes: &[u8], out: &mut Header) -> Result<()> {
                 }
                 let n = read_u32(endian, &bytes[cursor..cursor + 4]);
                 cursor += 4;
-                if code == 5 {
-                    out.reply_serial = Some(n);
+                match code {
+                    5 => out.reply_serial = Some(n),
+                    9 => out.unix_fds = n,
+                    _ => unreachable!(),
                 }
             }
             8 => {

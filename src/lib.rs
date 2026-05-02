@@ -29,6 +29,7 @@
 //! during the handshake, so whatever the upstream daemon supports is
 //! what the client sees.
 
+pub mod fdstream;
 pub mod filter;
 pub mod hci;
 pub mod introspect;

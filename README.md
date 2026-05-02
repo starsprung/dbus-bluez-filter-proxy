@@ -291,6 +291,7 @@ filter pipeline against a working bus.
 | Path | Notes |
 |---|---|
 | `src/proxy.rs` | Async relay: splice loop, call tracking, GMO/Introspect rewriting; SASL phase forwards bytes verbatim between client and upstream |
+| `src/fdstream.rs` | `recvmsg`/`sendmsg`-based async wrapper that preserves `SCM_RIGHTS` ancillary data so file descriptors carried on D-Bus messages survive the proxy |
 | `src/filter.rs` | BlueZ filter rules (adapter visibility, method-call policy) |
 | `src/wire.rs` | D-Bus wire message header parser |
 | `src/introspect.rs` | Streaming XML filter for Introspect responses |
