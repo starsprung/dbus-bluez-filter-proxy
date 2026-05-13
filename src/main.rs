@@ -27,7 +27,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use dbus_bluez_filter_proxy::{
-    filter::FilterConfig,
+    adapter_watcher,
+    filter::{self, FilterConfig},
     hci,
     proxy::{Proxy, ProxyConfig},
 };
@@ -101,13 +102,24 @@ async fn main() -> Result<()> {
         .peer_uid
         .unwrap_or_else(|| nix::unistd::geteuid().as_raw());
 
+    // The filter is shared between the proxy's relay tasks (read-only,
+    // per-message snapshot) and the adapter watcher (publishes new
+    // configs when a configured MAC's hciN changes — see
+    // [`adapter_watcher`] for the why).
+    let shared_filter = filter::shared(FilterConfig {
+        bluez_allowed_adapter_paths: bluez_allowed,
+    });
+    let _watcher = adapter_watcher::spawn(
+        cli.upstream.clone(),
+        cli.bluez_allow_macs.clone(),
+        shared_filter.clone(),
+    );
+
     let cfg = ProxyConfig {
         listen: cli.listen.clone(),
         upstream: cli.upstream,
         peer_uid,
-        filter: FilterConfig {
-            bluez_allowed_adapter_paths: bluez_allowed,
-        },
+        filter: shared_filter,
     };
 
     tracing::info!(

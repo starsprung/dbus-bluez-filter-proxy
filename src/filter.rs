@@ -33,7 +33,23 @@
 //!   * Introspect XML rewriting — `<node name="hciN"/>` entries for
 //!     disallowed adapters are stripped from `Introspect` responses.
 
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
+
+/// Live filter handle shared across all relay tasks and the adapter
+/// watcher. Reads are lock-free (`load()` returns an `Arc<FilterConfig>`
+/// snapshot); the watcher publishes new configs via `store()` when
+/// adapter add/remove events change the MAC→hciN mapping. Allows
+/// in-flight relay loops to pick up the new allow-list on their very
+/// next message without any per-message locking.
+pub type SharedFilter = Arc<ArcSwap<FilterConfig>>;
+
+/// Wrap a [`FilterConfig`] in the shared `Arc<ArcSwap<…>>` handle.
+pub fn shared(filter: FilterConfig) -> SharedFilter {
+    Arc::new(ArcSwap::from_pointee(filter))
+}
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct FilterConfig {
