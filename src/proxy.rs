@@ -66,7 +66,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, error, info};
 
 use crate::fdstream::FdStream;
-use crate::filter::{Decision, FilterConfig, MethodCallInfo};
+use crate::filter::{Decision, FilterConfig, MethodCallInfo, SharedFilter};
 use crate::introspect;
 use crate::wire::{self, MessageType};
 
@@ -88,8 +88,12 @@ pub struct ProxyConfig {
     /// running uid; production callers pass whatever uid the owning
     /// container is expected to connect as.
     pub peer_uid: u32,
-    /// BlueZ filter rules. Empty default = full pass-through.
-    pub filter: FilterConfig,
+    /// BlueZ filter rules. Wrapped in an `Arc<ArcSwap<_>>` so the
+    /// adapter watcher can publish updates (e.g. when a MAC's hciN
+    /// changes after an unplug/replug) and in-flight relay tasks
+    /// pick up the new allow-list lock-free on their next message.
+    /// Empty default = full pass-through.
+    pub filter: SharedFilter,
 }
 
 pub struct Proxy {
@@ -245,7 +249,7 @@ async fn handle_client(mut client: UnixStream, cfg: Arc<ProxyConfig>) -> Result<
     // argument (the announced object path) and drop the message
     // entirely if that path falls outside the allow list.
     let debug = std::env::var("DBUS_FILTER_PROXY_DEBUG").is_ok();
-    let filter = cfg.filter.clone();
+    let filter = Arc::clone(&cfg.filter);
     let inflight = std::sync::Arc::new(tokio::sync::Mutex::new(
         std::collections::HashMap::<u32, TrackedCall>::new(),
     ));
@@ -254,14 +258,14 @@ async fn handle_client(mut client: UnixStream, cfg: Arc<ProxyConfig>) -> Result<
     let u_send_for_c2u = u_send.clone();
     let c_send_for_c2u = c_send.clone();
     let inflight_for_c2u = std::sync::Arc::clone(&inflight);
-    let filter_for_c2u = filter.clone();
+    let filter_for_c2u = Arc::clone(&filter);
     let c2u = tokio::spawn(async move {
         relay_c2u(
             c_stream_for_c2u,
             u_send_for_c2u,
             c_send_for_c2u,
             inflight_for_c2u,
-            &filter_for_c2u,
+            filter_for_c2u,
             debug,
         )
         .await
@@ -269,7 +273,7 @@ async fn handle_client(mut client: UnixStream, cfg: Arc<ProxyConfig>) -> Result<
 
     let u_stream_for_u2c = std::sync::Arc::clone(&u_stream);
     let u2c = tokio::spawn(async move {
-        relay_u2c(u_stream_for_u2c, c_send, inflight, &filter, debug).await
+        relay_u2c(u_stream_for_u2c, c_send, inflight, filter, debug).await
     });
 
     tokio::select! {
@@ -313,7 +317,7 @@ async fn relay_c2u(
     u_send: Sender,
     c_send: Sender,
     inflight: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<u32, TrackedCall>>>,
-    filter: &FilterConfig,
+    filter: SharedFilter,
     debug: bool,
 ) -> std::io::Result<()> {
     let mut accum: Vec<u8> = Vec::with_capacity(4096);
@@ -362,6 +366,11 @@ async fn relay_c2u(
         // message header.
         let fds_for_msg = take_fds(&mut accum_fds, header.unix_fds as usize, debug, "c2u");
 
+        // Snapshot the filter for the lifetime of this message. The
+        // watcher may ArcSwap a new config in between iterations,
+        // which is what makes MAC→hciN re-resolution take effect
+        // without restarting the proxy.
+        let filter_snapshot = filter.load_full();
         match header.msg_type {
             MessageType::MethodCall => {
                 let info = MethodCallInfo {
@@ -370,7 +379,7 @@ async fn relay_c2u(
                     path: header.path.as_deref().unwrap_or(""),
                     sender: header.sender.as_deref(),
                 };
-                match filter.check_method_call(info) {
+                match filter_snapshot.check_method_call(info) {
                     Decision::Forward => {
                         // Track method calls whose replies we want
                         // to rewrite on the way back. Only for
@@ -488,7 +497,7 @@ async fn relay_u2c(
     u_stream: std::sync::Arc<FdStream>,
     c_send: Sender,
     inflight: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<u32, TrackedCall>>>,
-    filter: &FilterConfig,
+    filter: SharedFilter,
     debug: bool,
 ) -> std::io::Result<()> {
     let mut accum: Vec<u8> = Vec::with_capacity(4096);
@@ -535,6 +544,9 @@ async fn relay_u2c(
         // when `fds_for_msg` falls out of scope below.
         let fds_for_msg = take_fds(&mut accum_fds, header.unix_fds as usize, debug, "u2c");
 
+        // See relay_c2u: snapshot the filter once per message so
+        // ArcSwap publishes from the watcher are observed cleanly.
+        let filter_snapshot = filter.load_full();
         let out_bytes: Option<Vec<u8>> = match header.msg_type {
             MessageType::MethodReturn => {
                 let tracked = match header.reply_serial {
@@ -543,7 +555,7 @@ async fn relay_u2c(
                 };
                 match tracked {
                     Some(TrackedCall::GetManagedObjects) => {
-                        match rewrite_gmo_reply(&msg_bytes, filter) {
+                        match rewrite_gmo_reply(&msg_bytes, &filter_snapshot) {
                             Ok(rewritten) => {
                                 if debug {
                                     eprintln!(
@@ -563,7 +575,7 @@ async fn relay_u2c(
                         }
                     }
                     Some(TrackedCall::Introspect { object_path }) => {
-                        match rewrite_introspect_reply(&msg_bytes, &object_path, filter) {
+                        match rewrite_introspect_reply(&msg_bytes, &object_path, &filter_snapshot) {
                             Ok(rewritten) => {
                                 if debug {
                                     eprintln!(
@@ -594,7 +606,7 @@ async fn relay_u2c(
                 // PATH is where the emitter is — if that path is
                 // disallowed, the consumer shouldn't see it at all.
                 let path = header.path.as_deref().unwrap_or("");
-                if !filter.is_path_visible(path) {
+                if !filter_snapshot.is_path_visible(path) {
                     if debug {
                         eprintln!(
                             "[proxy] DROP signal {} on {path} (disallowed path)",
@@ -616,7 +628,7 @@ async fn relay_u2c(
                     );
                     if is_objmgr && is_added_or_removed {
                         match peek_object_path_arg(&msg_bytes, &header) {
-                            Ok(announced) if !filter.is_path_visible(&announced) => {
+                            Ok(announced) if !filter_snapshot.is_path_visible(&announced) => {
                                 if debug {
                                     eprintln!(
                                         "[proxy] DROP signal {} announcing {announced}",

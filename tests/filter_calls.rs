@@ -178,6 +178,69 @@ async fn calls_to_other_services_are_forwarded() {
     assert_eq!(reply, "hi");
 }
 
+/// Regression test for issue #1: when the watcher publishes a new
+/// allow-list (e.g. because the configured MAC moved from hci0 to
+/// hci1 across an unplug/replug), in-flight relay tasks must pick
+/// up the change on their very next message. This test fakes the
+/// publish step directly via `TestEnv::set_filter` — it does not
+/// exercise the dbus signal subscription, only the read-side ArcSwap
+/// path that subscription drives.
+#[tokio::test]
+async fn live_filter_update_takes_effect_on_existing_client_connection() {
+    let env = TestEnvBuilder::new()
+        .with_filter_allow_bluez_paths(vec!["/org/bluez/hci0".into()])
+        .start()
+        .await
+        .expect("env start");
+    register_fake_bluez(&env).await;
+
+    let client = zbus::ConnectionBuilder::address(env.proxy_addr())
+        .unwrap()
+        .build()
+        .await
+        .expect("connect via proxy");
+    let hci0 = zbus::Proxy::new(
+        &client,
+        "org.bluez",
+        "/org/bluez/hci0",
+        "org.bluez.FakeAdapter",
+    )
+    .await
+    .unwrap();
+    let hci1 = zbus::Proxy::new(
+        &client,
+        "org.bluez",
+        "/org/bluez/hci1",
+        "org.bluez.FakeAdapter",
+    )
+    .await
+    .unwrap();
+
+    // Initial state: hci0 allowed, hci1 denied.
+    let reply: String = hci0.call("Echo", &"a".to_string()).await.expect("hci0 ok");
+    assert_eq!(reply, "a");
+    let denied: zbus::Result<String> = hci1.call("Echo", &"a".to_string()).await;
+    assert!(
+        matches!(&denied, Err(zbus::Error::MethodError(name, _, _)) if name.as_str() == "org.freedesktop.DBus.Error.AccessDenied"),
+        "hci1 should be denied initially, got {denied:?}"
+    );
+
+    // Simulate the watcher detecting that our MAC moved from hci0 to
+    // hci1 and publishing the new allow-list. The same long-lived
+    // client connection should now see the flipped behaviour.
+    env.set_filter(dbus_bluez_filter_proxy::filter::FilterConfig {
+        bluez_allowed_adapter_paths: vec!["/org/bluez/hci1".into()],
+    });
+
+    let reply: String = hci1.call("Echo", &"b".to_string()).await.expect("hci1 ok after swap");
+    assert_eq!(reply, "b");
+    let denied: zbus::Result<String> = hci0.call("Echo", &"b".to_string()).await;
+    assert!(
+        matches!(&denied, Err(zbus::Error::MethodError(name, _, _)) if name.as_str() == "org.freedesktop.DBus.Error.AccessDenied"),
+        "hci0 should be denied after swap, got {denied:?}"
+    );
+}
+
 // ─── helpers ──────────────────────────────────────────────────────
 
 async fn register_fake_bluez(env: &TestEnv) {

@@ -33,7 +33,9 @@ use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 
-use dbus_bluez_filter_proxy::filter::FilterConfig;
+use std::sync::Arc;
+
+use dbus_bluez_filter_proxy::filter::{self, FilterConfig, SharedFilter};
 use dbus_bluez_filter_proxy::proxy::{Proxy, ProxyConfig};
 
 pub struct TestEnvBuilder {
@@ -72,6 +74,7 @@ pub struct TestEnv {
     proxy_addr: String,
     _upstream: Child,
     proxy_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+    filter: SharedFilter,
 }
 
 impl TestEnv {
@@ -118,11 +121,12 @@ impl TestEnv {
 
         wait_for_socket(&upstream_sock, Duration::from_secs(5)).await?;
 
+        let shared = filter::shared(filter);
         let cfg = ProxyConfig {
             listen: proxy_sock.clone(),
             upstream: upstream_sock.clone(),
             peer_uid: nix::unistd::geteuid().as_raw(),
-            filter,
+            filter: shared.clone(),
         };
         let proxy = Proxy::bind(cfg).await?;
         let proxy_handle = tokio::spawn(proxy.run());
@@ -135,7 +139,15 @@ impl TestEnv {
             proxy_addr: format!("unix:path={}", proxy_sock.display()),
             _upstream: upstream,
             proxy_handle,
+            filter: shared,
         })
+    }
+
+    /// Publish a new [`FilterConfig`] to the live proxy, the way the
+    /// adapter watcher would when a MAC's hciN changes. The next
+    /// message through either relay direction sees the new allow-list.
+    pub fn set_filter(&self, new: FilterConfig) {
+        self.filter.store(Arc::new(new));
     }
 
     pub fn proxy_addr(&self) -> &str {
