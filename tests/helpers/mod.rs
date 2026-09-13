@@ -154,6 +154,12 @@ impl TestEnv {
         &self.proxy_addr
     }
 
+    /// Kill the upstream `dbus-daemon`, simulating a bus restart.
+    /// Used to check that upstream disconnects propagate to clients.
+    pub async fn kill_upstream(&mut self) {
+        let _ = self._upstream.kill().await;
+    }
+
     pub fn upstream_addr(&self) -> &str {
         &self.upstream_addr
     }
