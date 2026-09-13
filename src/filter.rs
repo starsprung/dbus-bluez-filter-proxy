@@ -53,14 +53,38 @@ pub fn shared(filter: FilterConfig) -> SharedFilter {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct FilterConfig {
-    /// Object paths under `/org/bluez/` the consumer is allowed to
-    /// touch. Each entry is an exact path like `/org/bluez/hci0`;
-    /// the path itself and anything under it (e.g. device subtrees)
-    /// pass through. Other `/org/bluez/hciN/...` subtrees are
-    /// rejected with AccessDenied.
+    /// BlueZ adapter scoping.
     ///
-    /// Empty list disables BlueZ-side filtering — full pass-through.
-    pub bluez_allowed_adapter_paths: Vec<String>,
+    /// `None`: no `--bluez-allow-mac` configured. BlueZ-side filtering
+    /// is disabled and everything passes through.
+    ///
+    /// `Some(paths)`: filtering is enabled. Each entry is an exact
+    /// adapter path like `/org/bluez/hci0`; the path itself and
+    /// anything under it (e.g. device subtrees) pass through, every
+    /// other `/org/bluez/hciN/...` subtree is hidden and rejected with
+    /// AccessDenied. `Some(vec![])` therefore hides *every* adapter.
+    /// That is what the adapter watcher publishes while a configured
+    /// adapter is unplugged, so no other adapter leaks through in the
+    /// meantime — "enabled but empty" must never collapse into
+    /// "disabled".
+    pub bluez_allowed_adapter_paths: Option<Vec<String>>,
+}
+
+impl FilterConfig {
+    /// BlueZ filtering disabled: full pass-through. Same as `Default`.
+    pub fn pass_through() -> Self {
+        Self {
+            bluez_allowed_adapter_paths: None,
+        }
+    }
+
+    /// BlueZ filtering enabled; only `paths` (and their subtrees) are
+    /// visible. An empty `paths` hides every adapter.
+    pub fn bluez_allow(paths: Vec<String>) -> Self {
+        Self {
+            bluez_allowed_adapter_paths: Some(paths),
+        }
+    }
 }
 
 /// Decision the filter makes for a single message.
@@ -82,14 +106,14 @@ impl FilterConfig {
     /// call. Returns [`Decision::Forward`] for non-bluez destinations
     /// and bluez paths that aren't filtered.
     pub fn check_method_call(&self, info: MethodCallInfo<'_>) -> Decision {
-        if self.bluez_allowed_adapter_paths.is_empty() {
+        let Some(allowed) = &self.bluez_allowed_adapter_paths else {
             return Decision::Forward;
-        }
+        };
         // Anything not destined for org.bluez falls through.
         if info.destination != Some("org.bluez") {
             return Decision::Forward;
         }
-        if path_is_allowed(info.path, &self.bluez_allowed_adapter_paths) {
+        if path_is_allowed(info.path, allowed) {
             Decision::Forward
         } else {
             Decision::DenyMethodCall {
@@ -117,10 +141,10 @@ impl FilterConfig {
     /// path filter — root paths like `/org/bluez` itself return true
     /// here too because they're not adapter subtrees.
     pub fn is_path_visible(&self, path: &str) -> bool {
-        if self.bluez_allowed_adapter_paths.is_empty() {
-            return true;
+        match &self.bluez_allowed_adapter_paths {
+            None => true,
+            Some(allowed) => path_is_allowed(path, allowed),
         }
-        path_is_allowed(path, &self.bluez_allowed_adapter_paths)
     }
 }
 
@@ -159,9 +183,7 @@ mod tests {
     use super::*;
 
     fn cfg(allowed: &[&str]) -> FilterConfig {
-        FilterConfig {
-            bluez_allowed_adapter_paths: allowed.iter().map(|s| s.to_string()).collect(),
-        }
+        FilterConfig::bluez_allow(allowed.iter().map(|s| s.to_string()).collect())
     }
 
     fn call<'a>(path: &'a str, dest: Option<&'a str>) -> MethodCallInfo<'a> {
@@ -174,10 +196,31 @@ mod tests {
     }
 
     #[test]
-    fn empty_allow_list_lets_everything_through() {
-        let c = cfg(&[]);
+    fn no_filter_configured_lets_everything_through() {
+        let c = FilterConfig::default();
         let d = c.check_method_call(call("/org/bluez/hci1", Some("org.bluez")));
         assert_eq!(d, Decision::Forward);
+        assert!(c.is_path_visible("/org/bluez/hci1"));
+    }
+
+    /// Filtering enabled with nothing allowed — the state the adapter
+    /// watcher publishes while the configured adapter is unplugged.
+    /// Must hide every adapter, not fall open.
+    #[test]
+    fn empty_allow_list_hides_every_adapter() {
+        let c = cfg(&[]);
+        for p in ["/org/bluez/hci0", "/org/bluez/hci1/dev_99"] {
+            let d = c.check_method_call(call(p, Some("org.bluez")));
+            assert!(matches!(d, Decision::DenyMethodCall { .. }), "{p}: got {d:?}");
+            assert!(!c.is_path_visible(p), "{p} should be hidden");
+        }
+        // Root paths stay reachable so enumeration still works (and
+        // returns nothing).
+        assert_eq!(
+            c.check_method_call(call("/org/bluez", Some("org.bluez"))),
+            Decision::Forward
+        );
+        assert!(c.is_path_visible("/org/bluez"));
     }
 
     #[test]

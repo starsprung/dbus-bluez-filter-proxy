@@ -138,9 +138,7 @@ mod tests {
     /// Helper: lift the production filter into a closure for tests.
     /// Mirrors how proxy.rs invokes filter_xml in production.
     fn allow<'a>(paths: &[&str]) -> impl Fn(&str) -> bool + use<> {
-        let cfg = FilterConfig {
-            bluez_allowed_adapter_paths: paths.iter().map(|s| s.to_string()).collect(),
-        };
+        let cfg = FilterConfig::bluez_allow(paths.iter().map(|s| s.to_string()).collect());
         move |p| cfg.is_path_visible(p)
     }
 

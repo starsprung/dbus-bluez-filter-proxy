@@ -64,6 +64,13 @@ Adapter scoping is by MAC address. The proxy resolves each MAC to its current
 kernel index (`hci0`, `hci1`, ...) at startup using HCI ioctls, so the rules
 stay correct across reboots even if Linux reorders the adapters.
 
+The mapping is also kept up to date at runtime: whenever BlueZ announces an
+adapter appearing or disappearing, the proxy re-reads the kernel's adapter
+list. While a configured adapter is absent (unplugged, or not yet
+re-announced after a replug) the consumer sees *no* adapter at all; once it
+returns, at whatever `hciN` the kernel assigns, it becomes visible again.
+The filter never falls open because an adapter went away.
+
 ## Authentication: peer UID matching
 
 D-Bus on Linux uses SASL EXTERNAL authentication, which is satisfied by the
