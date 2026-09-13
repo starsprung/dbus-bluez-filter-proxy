@@ -96,7 +96,7 @@ pub struct ProxyConfig {
     /// adapter watcher can publish updates (e.g. when a MAC's hciN
     /// changes after an unplug/replug) and in-flight relay tasks
     /// pick up the new allow-list lock-free on their next message.
-    /// Empty default = full pass-through.
+    /// Default (`None`) = full pass-through.
     pub filter: SharedFilter,
 }
 
@@ -1266,9 +1266,7 @@ mod tests {
             build_entry("/org/bluez/hci1", 0x11, true),
             build_entry("/org/bluez/hci2", 0x12, false), // upstream last: no trailing pad
         ]);
-        let filter = FilterConfig {
-            bluez_allowed_adapter_paths: vec!["/org/bluez/hci1".into()],
-        };
+        let filter = FilterConfig::bluez_allow(vec!["/org/bluez/hci1".into()]);
         let out = rewrite_gmo_reply(&upstream, &filter).expect("rewrite");
 
         let body_start = align8(wire::FIXED_HEADER_LEN);
@@ -1321,9 +1319,7 @@ mod tests {
             build_entry("/org/bluez/hci0", 0x10, true),
             build_entry("/org/bluez/hci1", 0x11, false), // upstream last: no trailing pad
         ]);
-        let filter = FilterConfig {
-            bluez_allowed_adapter_paths: vec!["/org/bluez/hci1".into()],
-        };
+        let filter = FilterConfig::bluez_allow(vec!["/org/bluez/hci1".into()]);
         let out = rewrite_gmo_reply(&upstream, &filter).expect("rewrite");
         let body_start = align8(wire::FIXED_HEADER_LEN);
         let new_body = &out[body_start..];

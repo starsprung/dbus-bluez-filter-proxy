@@ -228,9 +228,9 @@ async fn live_filter_update_takes_effect_on_existing_client_connection() {
     // Simulate the watcher detecting that our MAC moved from hci0 to
     // hci1 and publishing the new allow-list. The same long-lived
     // client connection should now see the flipped behaviour.
-    env.set_filter(dbus_bluez_filter_proxy::filter::FilterConfig {
-        bluez_allowed_adapter_paths: vec!["/org/bluez/hci1".into()],
-    });
+    env.set_filter(dbus_bluez_filter_proxy::filter::FilterConfig::bluez_allow(vec![
+        "/org/bluez/hci1".into(),
+    ]));
 
     let reply: String = hci1.call("Echo", &"b".to_string()).await.expect("hci1 ok after swap");
     assert_eq!(reply, "b");
@@ -239,6 +239,56 @@ async fn live_filter_update_takes_effect_on_existing_client_connection() {
         matches!(&denied, Err(zbus::Error::MethodError(name, _, _)) if name.as_str() == "org.freedesktop.DBus.Error.AccessDenied"),
         "hci0 should be denied after swap, got {denied:?}"
     );
+}
+
+/// Regression test: while a configured adapter is absent (unplugged,
+/// or not yet re-announced by bluetoothd after a replug) the watcher
+/// publishes an EMPTY allow-list. That must mean "no adapter visible",
+/// not "filter off" — otherwise the consumer sees every adapter on the
+/// host until its own comes back.
+#[tokio::test]
+async fn absent_adapter_keeps_every_adapter_hidden() {
+    let env = TestEnvBuilder::new()
+        .with_filter_allow_bluez_paths(vec!["/org/bluez/hci0".into()])
+        .start()
+        .await
+        .expect("env start");
+    register_fake_bluez(&env).await;
+
+    let client = zbus::ConnectionBuilder::address(env.proxy_addr())
+        .unwrap()
+        .build()
+        .await
+        .expect("connect via proxy");
+    let hci0 = zbus::Proxy::new(&client, "org.bluez", "/org/bluez/hci0", "org.bluez.FakeAdapter")
+        .await
+        .unwrap();
+    let hci1 = zbus::Proxy::new(&client, "org.bluez", "/org/bluez/hci1", "org.bluez.FakeAdapter")
+        .await
+        .unwrap();
+
+    let reply: String = hci0.call("Echo", &"a".to_string()).await.expect("hci0 ok initially");
+    assert_eq!(reply, "a");
+
+    // Exactly what adapter_watcher::reconcile() publishes when the
+    // configured MAC has no live adapter.
+    env.set_filter(dbus_bluez_filter_proxy::filter::FilterConfig::bluez_allow(vec![]));
+
+    for (name, p) in [("hci0", &hci0), ("hci1", &hci1)] {
+        let r: zbus::Result<String> = p.call("Echo", &"b".to_string()).await;
+        assert!(
+            matches!(&r, Err(zbus::Error::MethodError(n, _, _))
+                if n.as_str() == "org.freedesktop.DBus.Error.AccessDenied"),
+            "{name} must be denied while the configured adapter is absent, got {r:?}"
+        );
+    }
+
+    // The adapter comes back, possibly at a different hciN.
+    env.set_filter(dbus_bluez_filter_proxy::filter::FilterConfig::bluez_allow(vec![
+        "/org/bluez/hci1".into(),
+    ]));
+    let reply: String = hci1.call("Echo", &"c".to_string()).await.expect("hci1 ok after replug");
+    assert_eq!(reply, "c");
 }
 
 // ─── helpers ──────────────────────────────────────────────────────

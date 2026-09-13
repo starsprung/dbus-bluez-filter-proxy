@@ -50,10 +50,11 @@ impl TestEnvBuilder {
     }
 
     /// BlueZ adapter paths the filter should permit. Anything else
-    /// under `/org/bluez/` gets `AccessDenied`. Empty list means
-    /// `/org/bluez/*` is fully open (default pass-through).
+    /// under `/org/bluez/` gets `AccessDenied`. An empty list hides
+    /// every adapter; don't call this at all for the default
+    /// pass-through.
     pub fn with_filter_allow_bluez_paths(mut self, paths: Vec<String>) -> Self {
-        self.filter.bluez_allowed_adapter_paths = paths;
+        self.filter = FilterConfig::bluez_allow(paths);
         self
     }
 

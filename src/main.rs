@@ -106,8 +106,16 @@ async fn main() -> Result<()> {
     // per-message snapshot) and the adapter watcher (publishes new
     // configs when a configured MAC's hciN changes — see
     // [`adapter_watcher`] for the why).
-    let shared_filter = filter::shared(FilterConfig {
-        bluez_allowed_adapter_paths: bluez_allowed,
+    //
+    // No MACs configured => BlueZ filtering disabled (`None`). Any MAC
+    // configured => filtering enabled (`Some`), and it stays enabled
+    // even if the watcher later empties the list while the adapter is
+    // unplugged — an empty list hides everything rather than turning
+    // the filter off.
+    let shared_filter = filter::shared(if cli.bluez_allow_macs.is_empty() {
+        FilterConfig::pass_through()
+    } else {
+        FilterConfig::bluez_allow(bluez_allowed)
     });
     let _watcher = adapter_watcher::spawn(
         cli.upstream.clone(),

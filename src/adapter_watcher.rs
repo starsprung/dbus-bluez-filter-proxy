@@ -39,7 +39,9 @@
 //! If a configured MAC is currently absent, its entry is left out
 //! of the allow-list (conservative: a different adapter that takes
 //! the old `hciN` won't accidentally inherit the allow). When the
-//! MAC reappears at any `hciN`, the next signal re-adds it.
+//! MAC reappears at any `hciN`, the next signal re-adds it. The
+//! published config is always `Some(..)` — filtering stays enabled —
+//! so an empty list means "no adapter visible", never "filter off".
 //!
 //! Reconnect logic: if the upstream connection drops (dbus-daemon
 //! restart, transient I/O error) we log and retry with capped
@@ -149,14 +151,12 @@ fn reconcile(macs: &[String], filter: &SharedFilter) {
     };
     let new_paths = compute_allowed_paths(macs, &adapters);
     let current = filter.load();
-    if current.bluez_allowed_adapter_paths != new_paths {
+    if current.bluez_allowed_adapter_paths.as_deref() != Some(new_paths.as_slice()) {
         info!(
             "adapter watcher: bluez allow updated {:?} -> {:?}",
             current.bluez_allowed_adapter_paths, new_paths
         );
-        filter.store(Arc::new(FilterConfig {
-            bluez_allowed_adapter_paths: new_paths,
-        }));
+        filter.store(Arc::new(FilterConfig::bluez_allow(new_paths)));
     } else {
         debug!("adapter watcher: signal received, mapping unchanged");
     }
@@ -235,7 +235,10 @@ mod tests {
         // hci0 used to be our MAC. Now hci0 belongs to a different
         // physical adapter (MAC :02) and our MAC is gone. The
         // allow-list must be EMPTY — otherwise we'd be silently
-        // exposing the wrong adapter to the consumer.
+        // exposing the wrong adapter to the consumer. (reconcile()
+        // publishes it as `Some(vec![])`, which FilterConfig treats
+        // as "every adapter hidden", not as "filter disabled" — see
+        // filter::tests::empty_allow_list_hides_every_adapter.)
         let macs = vec!["AA:BB:CC:DD:EE:01".into()];
         let adapters = vec![ad("hci0", "AA:BB:CC:DD:EE:02")];
         let paths = compute_allowed_paths(&macs, &adapters);
