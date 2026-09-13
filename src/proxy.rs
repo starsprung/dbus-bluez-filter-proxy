@@ -31,12 +31,15 @@
 //!      credentials, but those credentials terminate at the proxy;
 //!      upstream sees the proxy's creds, set in step 3, instead.
 //!   5. Run a bidirectional byte-shuttle between client and upstream.
-//!      Forward each `\r\n`-terminated SASL line verbatim in both
-//!      directions until the line `BEGIN\r\n` is seen from the
-//!      client. That line is forwarded too; anything in the same
-//!      buffer past `BEGIN\r\n` is the post-SASL carryover (sd-bus's
-//!      pipelined fast-path packs `BEGIN` and the first message into
-//!      one syscall).
+//!      Forward each `\r\n`-terminated SASL line in both directions
+//!      until the line `BEGIN\r\n` is seen from the client. That line
+//!      is forwarded too; anything in the same buffer past `BEGIN\r\n`
+//!      is the post-SASL carryover (sd-bus's pipelined fast-path packs
+//!      `BEGIN` and the first message into one syscall). Lines are
+//!      forwarded verbatim with one exception: the uid the client
+//!      claims in `AUTH EXTERNAL` (or the follow-up `DATA`) is replaced
+//!      with the proxy's own, because upstream validates it against
+//!      the proxy's `SO_PEERCRED`, not the client's.
 //!   6. Spawn two tasks: client→upstream and upstream→client. Each
 //!      task parses message headers so the BlueZ filter rules can
 //!      apply (method-call denial, GMO/Introspect response rewriting,
@@ -1049,6 +1052,14 @@ fn sync_connect_upstream_with_creds(
 /// reject) or, after the SASL phase, as a stray byte ahead of the
 /// first message frame.
 ///
+/// Client lines are forwarded verbatim except for the EXTERNAL
+/// identity, which [`rewrite_external_identity`] replaces with the
+/// proxy's own uid: the proxy has already authorised the client via
+/// `SO_PEERCRED` on its own socket, and upstream will compare
+/// whatever identity it receives against the proxy's `SO_PEERCRED`.
+/// Without the rewrite, `--peer-uid` set to anything other than the
+/// proxy's own uid fails with `REJECTED EXTERNAL`.
+///
 /// After `BEGIN\r\n` is forwarded the function does not return
 /// immediately: it tracks how many response-expecting commands were
 /// sent c→u (every command except `BEGIN`) and waits until upstream
@@ -1076,6 +1087,11 @@ async fn forward_sasl(
             nul[0]
         );
     }
+
+    // Identity to present upstream in the EXTERNAL exchange. Hex of
+    // the decimal uid, as every D-Bus client encodes it.
+    let own_uid_hex = hex::encode(nix::unistd::geteuid().as_raw().to_string());
+    let mut awaiting_external_data = false;
 
     let mut c2u_pending: Vec<u8> = Vec::with_capacity(256);
     let mut u2c_pending: Vec<u8> = Vec::with_capacity(256);
@@ -1114,11 +1130,16 @@ async fn forward_sasl(
                 // bytes still buffered after it are carryover.
                 while let Some(crlf) = c2u_pending.windows(2).position(|w| w == b"\r\n") {
                     let line_end = crlf + 2;
+                    let is_begin = c2u_pending[..crlf] == *b"BEGIN";
+                    let out = rewrite_external_identity(
+                        &c2u_pending[..line_end],
+                        &mut awaiting_external_data,
+                        &own_uid_hex,
+                    );
                     upstream
-                        .write_all(&c2u_pending[..line_end])
+                        .write_all(&out)
                         .await
                         .context("forward SASL line to upstream")?;
-                    let is_begin = c2u_pending[..crlf] == *b"BEGIN";
                     c2u_pending.drain(..line_end);
                     if is_begin {
                         begin_sent = true;
@@ -1149,6 +1170,72 @@ async fn forward_sasl(
                     pending_replies = pending_replies.saturating_sub(1);
                 }
             }
+        }
+    }
+}
+
+/// Rewrite the identity a client claims in SASL EXTERNAL to the
+/// proxy's own uid.
+///
+/// dbus-daemon validates the identity in `AUTH EXTERNAL <hex-uid>`
+/// (or, if the client sent none and was prompted with `DATA`, the
+/// follow-up `DATA <hex-uid>`) against the connecting socket's
+/// `SO_PEERCRED` — which on the upstream connection is the *proxy's*
+/// uid, not the client's. Every mainstream client (libdbus, sd-bus,
+/// GDBus, zbus, dbus-fast) sends its own uid there, so forwarding it
+/// verbatim fails with `REJECTED EXTERNAL` whenever `--peer-uid`
+/// differs from the uid the proxy runs as.
+///
+/// `line` is one complete `\r\n`-terminated client line. `awaiting_data`
+/// carries state across lines: set after an `AUTH EXTERNAL` with no
+/// initial response, cleared by the next client command. Returns the
+/// bytes to forward upstream.
+fn rewrite_external_identity(line: &[u8], awaiting_data: &mut bool, own_uid_hex: &str) -> Vec<u8> {
+    fn split_first_space(b: &[u8]) -> (&[u8], Option<&[u8]>) {
+        match b.iter().position(|&c| c == b' ') {
+            Some(i) => (&b[..i], Some(&b[i + 1..])),
+            None => (b, None),
+        }
+    }
+    let with_identity = |prefix: &[u8]| -> Vec<u8> {
+        let mut out = Vec::with_capacity(prefix.len() + 1 + own_uid_hex.len() + 2);
+        out.extend_from_slice(prefix);
+        out.push(b' ');
+        out.extend_from_slice(own_uid_hex.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        out
+    };
+
+    let body = line.strip_suffix(b"\r\n").unwrap_or(line);
+    let (cmd, rest) = split_first_space(body);
+    match cmd {
+        b"AUTH" => {
+            let (mech, initial) = rest.map(split_first_space).unwrap_or((b"", None));
+            if mech != b"EXTERNAL" {
+                *awaiting_data = false;
+                return line.to_vec();
+            }
+            match initial {
+                Some(data) if !data.is_empty() => {
+                    *awaiting_data = false;
+                    with_identity(b"AUTH EXTERNAL")
+                }
+                _ => {
+                    // No initial response: upstream will answer
+                    // `DATA` and the client's next line carries the
+                    // identity.
+                    *awaiting_data = true;
+                    line.to_vec()
+                }
+            }
+        }
+        b"DATA" if *awaiting_data => {
+            *awaiting_data = false;
+            with_identity(b"DATA")
+        }
+        _ => {
+            *awaiting_data = false;
+            line.to_vec()
         }
     }
 }
@@ -1332,5 +1419,54 @@ mod tests {
         let (_es, _ee, inner_end, path) = &kept[0];
         assert_eq!(path, "/org/bluez/hci1");
         assert_eq!(array_data_end, *inner_end);
+    }
+
+    // ─── SASL EXTERNAL identity rewrite ─────────────────────────────
+
+    const OWN: &str = "31303030"; // hex("1000")
+
+    fn rewrite(line: &str, awaiting: &mut bool) -> String {
+        String::from_utf8(rewrite_external_identity(line.as_bytes(), awaiting, OWN)).unwrap()
+    }
+
+    #[test]
+    fn auth_external_initial_response_is_replaced() {
+        let mut awaiting = false;
+        // hex("0") — a root client behind a proxy running as 1000.
+        assert_eq!(rewrite("AUTH EXTERNAL 30\r\n", &mut awaiting), "AUTH EXTERNAL 31303030\r\n");
+        assert!(!awaiting);
+    }
+
+    #[test]
+    fn auth_external_without_initial_response_rewrites_following_data() {
+        let mut awaiting = false;
+        assert_eq!(rewrite("AUTH EXTERNAL\r\n", &mut awaiting), "AUTH EXTERNAL\r\n");
+        assert!(awaiting, "should expect the identity on the next DATA line");
+        assert_eq!(rewrite("DATA 30\r\n", &mut awaiting), "DATA 31303030\r\n");
+        assert!(!awaiting);
+        // A later DATA (not part of an EXTERNAL exchange) is untouched.
+        assert_eq!(rewrite("DATA 30\r\n", &mut awaiting), "DATA 30\r\n");
+    }
+
+    #[test]
+    fn other_mechanisms_and_commands_pass_verbatim() {
+        let mut awaiting = false;
+        for line in [
+            "AUTH DBUS_COOKIE_SHA1 30\r\n",
+            "AUTH\r\n",
+            "NEGOTIATE_UNIX_FD\r\n",
+            "CANCEL\r\n",
+            "BEGIN\r\n",
+        ] {
+            assert_eq!(rewrite(line, &mut awaiting), line);
+            assert!(!awaiting);
+        }
+        // An AUTH for a different mechanism cancels a pending EXTERNAL
+        // DATA expectation.
+        rewrite("AUTH EXTERNAL\r\n", &mut awaiting);
+        assert!(awaiting);
+        rewrite("AUTH ANONYMOUS\r\n", &mut awaiting);
+        assert!(!awaiting);
+        assert_eq!(rewrite("DATA 30\r\n", &mut awaiting), "DATA 30\r\n");
     }
 }

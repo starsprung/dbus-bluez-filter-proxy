@@ -79,7 +79,13 @@ server then checks that the peer UID matches an expected value.
 
 The proxy plays the server role for downstream clients. **It will only
 accept connections from a client running as the UID specified by
-`--peer-uid` (defaults to the UID the proxy itself is running as).**
+`--peer-uid` (defaults to the UID the proxy itself is running as).** That
+check is made against `SO_PEERCRED` on the proxy's own listening socket.
+The client's SASL exchange is otherwise forwarded to the real bus as-is,
+with one substitution: the UID the client claims in `AUTH EXTERNAL` is
+replaced with the proxy's own UID, because the real bus validates that
+claim against *its* `SO_PEERCRED`, which identifies the proxy, not the
+client.
 
 This has practical consequences:
 
