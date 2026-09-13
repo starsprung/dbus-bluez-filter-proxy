@@ -42,6 +42,10 @@
 //!      apply (method-call denial, GMO/Introspect response rewriting,
 //!      signal filtering); message bodies that aren't being rewritten
 //!      pass through untouched.
+//!   7. When either direction ends (peer EOF or error), abort the
+//!      other and close both sockets, so a client disconnect is
+//!      visible upstream and an upstream disconnect is visible to the
+//!      client.
 //!
 //! Why transparent SASL forwarding rather than re-implementing the
 //! handshake locally: the SASL `OK <guid>` line carries the upstream
@@ -276,10 +280,24 @@ async fn handle_client(mut client: UnixStream, cfg: Arc<ProxyConfig>) -> Result<
         relay_u2c(u_stream_for_u2c, c_send, inflight, filter, debug).await
     });
 
+    // Whichever direction finishes first (peer EOF, I/O error, or an
+    // unparseable frame), the session is over: abort the other one.
+    // Dropping a `JoinHandle` only *detaches* its task, and the
+    // surviving relay holds `Arc<FdStream>` handles to both sockets,
+    // so without the abort neither socket closes. dbus-daemon then
+    // never sees the client leave — BlueZ never gets the
+    // `NameOwnerChanged` that tears down that client's agents,
+    // advertisements, GATT applications and device connections — and
+    // in the other direction an idle client never sees upstream go
+    // away. Aborting drops the last Arcs, which closes both fds.
+    let mut c2u = c2u;
+    let mut u2c = u2c;
     tokio::select! {
-        r = c2u => if debug { eprintln!("[proxy] c2u exit: {r:?}"); },
-        r = u2c => if debug { eprintln!("[proxy] u2c exit: {r:?}"); },
+        r = &mut c2u => if debug { eprintln!("[proxy] c2u exit: {r:?}"); },
+        r = &mut u2c => if debug { eprintln!("[proxy] u2c exit: {r:?}"); },
     }
+    c2u.abort();
+    u2c.abort();
     Ok(())
 }
 
